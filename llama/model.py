@@ -204,16 +204,16 @@ class Transformer(nn.Module):
 
         self.tok_embeddings = ParallelEmbedding(
             params.vocab_size, params.dim, init_method=lambda x: x
-        )
+        ).cuda()
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
 
-        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps).cuda()
         self.output = ColumnParallelLinear(
             params.dim, params.vocab_size, bias=False, init_method=lambda x: x
-        )
+        ).cuda()
 
         self.freqs_cis = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
@@ -232,7 +232,9 @@ class Transformer(nn.Module):
             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
 
         for layer in self.layers:
+            layer.cuda()
             h = layer(h, start_pos, freqs_cis, mask)
+            layer.cpu()
         h = self.norm(h)
         output = self.output(h[:, -1, :])  # only compute last logits
         return output.float()
