@@ -16,6 +16,22 @@ from fairscale.nn.model_parallel.layers import (
     ColumnParallelLinear,
 )
 
+def move_parameters_to_gpu(module):
+    if not hasattr(module, "saved"):
+        module.saved = module._parameters.copy()
+    for k, param in module.saved.items():
+        if param is not None:
+            module._parameters[k] = param.to("cuda", non_blocking=True)
+    for child in module.children():
+        move_parameters_to_gpu(child)
+
+def move_parameters_to_cpu(module):
+    for k, param in module.saved.items():
+        del module._parameters[k]
+        module._parameters[k] = param
+    for child in module.children():
+        move_parameters_to_cpu(child)
+
 
 @dataclass
 class ModelArgs:
@@ -232,9 +248,9 @@ class Transformer(nn.Module):
             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
 
         for layer in self.layers:
-            layer.cuda()
+            move_parameters_to_gpu(layer)
             h = layer(h, start_pos, freqs_cis, mask)
-            layer.cpu()
+            move_parameters_to_cpu(layer)
         h = self.norm(h)
         output = self.output(h[:, -1, :])  # only compute last logits
         return output.float()
