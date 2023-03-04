@@ -4,6 +4,7 @@
 from typing import List
 
 import torch
+import time
 
 from llama.tokenizer import Tokenizer
 from llama.model import Transformer
@@ -39,6 +40,7 @@ class LLaMA:
         start_pos = min_prompt_size
         prev_pos = 0
         for cur_pos in range(start_pos, total_len):
+            start_time = time.time()
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
             if temperature > 0:
                 probs = torch.softmax(logits / temperature, dim=-1)
@@ -52,6 +54,8 @@ class LLaMA:
             )
             tokens[:, cur_pos] = next_token
             prev_pos = cur_pos
+            print(f"Token in {time.time() - start_time:.2f} seconds")
+
 
         decoded = []
         for i, t in enumerate(tokens.tolist()):
