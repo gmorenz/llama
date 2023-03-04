@@ -19,6 +19,9 @@ from fairscale.nn.model_parallel.layers import (
 def move_parameters_to_gpu(module):
     if not hasattr(module, "saved"):
         module.saved = module._parameters.copy()
+        for param in module.saved.values():
+            if param is not None:
+                param.pin_memory()
     for k, param in module.saved.items():
         if param is not None:
             module._parameters[k] = param.to("cuda", non_blocking=True)
@@ -225,6 +228,7 @@ class Transformer(nn.Module):
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
+        move_parameters_to_gpu(self.layers[0])
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps).cuda()
         self.output = ColumnParallelLinear(
@@ -247,10 +251,11 @@ class Transformer(nn.Module):
             mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=tokens.device)
             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
 
-        for layer in self.layers:
-            move_parameters_to_gpu(layer)
-            h = layer(h, start_pos, freqs_cis, mask)
-            move_parameters_to_cpu(layer)
+        for i in range(len(self.layers)):
+            # Start moving *next* layer to memory as we evaluate this layer
+            move_parameters_to_gpu(self.layers[ (i + 1) % len(self.layers) ])
+            h = self.layers[i](h, start_pos, freqs_cis, mask)
+            move_parameters_to_cpu(self.layers[i])
         h = self.norm(h)
         output = self.output(h[:, -1, :])  # only compute last logits
         return output.float()
