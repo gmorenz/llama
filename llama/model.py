@@ -1,20 +1,53 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the GNU General Public License version 3.
 
+from math import prod
+from pathlib import Path
 from typing import Optional, Tuple
 from dataclasses import dataclass
 import math
+import threading
+import queue
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-import fairscale.nn.model_parallel.initialize as fs_init
-from fairscale.nn.model_parallel.layers import (
-    ParallelEmbedding,
-    RowParallelLinear,
-    ColumnParallelLinear,
-)
+# Pytorches load_state_dict tries to copy the weights to the existing
+# tensors. Which doesn't work if the existing tensors are meta tensors.
+def actually_load_state_dict(module, state_dict):
+    for path, param in state_dict.items():
+        attrs = path.split('.')
+        local = module
+        for attr in attrs[:-1]:
+            local = local._modules[attr]
+        assert local._parameters[attrs[-1]].size() == param.size()
+        local._parameters[attrs[-1]] = param
+
+
+def load_weight_file(file, example_tensor):
+    assert example_tensor.dtype == torch.half
+    storage = torch.HalfStorage.from_file(str(file), shared=True, size=example_tensor.numel())
+    t = torch.HalfTensor()
+    t.set_(storage, 0, example_tensor.size(), example_tensor.stride())
+
+    # # Copy tensor from an mmaped file (still on disk) to memory.
+    # # Surprisingly this actually makes the code slower, offloading
+    # # the reading to another thread not actually speeding things up.
+    # # I'm unsure why. Feel free to experiment
+    # t = t.to("cpu", copy=True)
+
+    return t
+
+def weight_load_thread(tx: queue.Queue, weights_dir, layer_count, example_module_parameters):
+    while True:
+        for layer_id in range(layer_count):
+            state_dict = dict()
+            for name, parameter in example_module_parameters.items():
+                file = Path(weights_dir).joinpath(f"layers.{layer_id}.{name}")
+                t = load_weight_file(file, parameter)
+                state_dict[name] = nn.Parameter(t)
+            tx.put(state_dict, block=True)
 
 
 @dataclass
@@ -31,10 +64,10 @@ class ModelArgs:
 
 
 class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, device=None):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim, device=device))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -74,39 +107,35 @@ def apply_rotary_emb(
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, device=None):
         super().__init__()
 
-        self.n_local_heads = args.n_heads // fs_init.get_model_parallel_world_size()
+        self.n_local_heads = args.n_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = ColumnParallelLinear(
+        self.wq = nn.Linear(
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
+            device=device,
         )
-        self.wk = ColumnParallelLinear(
+        self.wk = nn.Linear(
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
+            device=device,
         )
-        self.wv = ColumnParallelLinear(
+        self.wv = nn.Linear(
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
+            device=device,
         )
-        self.wo = RowParallelLinear(
+        self.wo = nn.Linear(
             args.n_heads * self.head_dim,
             args.dim,
             bias=False,
-            input_is_parallel=True,
-            init_method=lambda x: x,
+            device=device,
         )
 
         self.cache_k = torch.zeros(
@@ -156,19 +185,20 @@ class FeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         multiple_of: int,
+        device=None,
     ):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+        self.w1 = nn.Linear(
+            dim, hidden_dim, bias=False, device=device,
         )
-        self.w2 = RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
+        self.w2 = nn.Linear(
+            hidden_dim, dim, bias=False, device=device,
         )
-        self.w3 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+        self.w3 = nn.Linear(
+            dim, hidden_dim, bias=False, device=device,
         )
 
     def forward(self, x):
@@ -176,18 +206,18 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: ModelArgs):
+    def __init__(self, layer_id: int, args: ModelArgs, device=None):
         super().__init__()
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
-        self.attention = Attention(args)
+        self.attention = Attention(args, device=device)
         self.feed_forward = FeedForward(
-            dim=args.dim, hidden_dim=4 * args.dim, multiple_of=args.multiple_of
+            dim=args.dim, hidden_dim=4 * args.dim, multiple_of=args.multiple_of, device=device
         )
         self.layer_id = layer_id
-        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps, device=device)
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps, device=device)
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
         h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_cis, mask)
@@ -196,24 +226,38 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, params: ModelArgs):
+    def __init__(self, weight_dir, params: ModelArgs, device=None):
         super().__init__()
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
-        self.tok_embeddings = ParallelEmbedding(
-            params.vocab_size, params.dim, init_method=lambda x: x
-        )
+        self.tok_embeddings = nn.Embedding(
+            params.vocab_size, params.dim
+        ).cuda()
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
+            self.layers.append(TransformerBlock(layer_id, params, device=device))
 
-        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = ColumnParallelLinear(
-            params.dim, params.vocab_size, bias=False, init_method=lambda x: x
-        )
+        # I initially planned to use multiprocessing here, but torch.multiprocessing.Queue
+        # seems to have a bug on my system. It ends up in an infinite loop of complaining
+        # about a BadFD.
+        self.queue = queue.Queue(maxsize=1)
+        self.weight_thread = threading.Thread(
+            target=weight_load_thread,
+            args=(
+                self.queue,
+                weight_dir,
+                params.n_layers,
+                dict(self.layers[0].named_parameters()),
+            )
+        ).start()
+
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps).cuda()
+        self.output = nn.Linear(
+            params.dim, params.vocab_size, bias=False
+        ).cuda()
 
         self.freqs_cis = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
@@ -232,7 +276,12 @@ class Transformer(nn.Module):
             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
 
         for layer in self.layers:
+            state_dict = self.queue.get(block=True)
+            actually_load_state_dict(layer, state_dict)
+            del state_dict
+            layer.to("cuda", non_blocking = True)
             h = layer(h, start_pos, freqs_cis, mask)
+            layer.to("meta")
         h = self.norm(h)
         output = self.output(h[:, -1, :])  # only compute last logits
         return output.float()
